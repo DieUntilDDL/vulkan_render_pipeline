@@ -5,6 +5,7 @@
 #include <SDL_vulkan.h>
 
 #include <glm/gtx/transform.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 #include <vk_initializers.h>
 #include <vk_types.h>
@@ -31,42 +32,36 @@ constexpr bool bUseValidationLayers = false;
 VulkanEngine& VulkanEngine::Get() { return *loadedEngine; }
 
 bool is_visible(const RenderObject& obj, const glm::mat4& viewproj) {
-    std::array<glm::vec3, 8> corners{
-        glm::vec3 { 1, 1, 1 },
-        glm::vec3 { 1, 1, -1 },
-        glm::vec3 { 1, -1, 1 },
-        glm::vec3 { 1, -1, -1 },
-        glm::vec3 { -1, 1, 1 },
-        glm::vec3 { -1, 1, -1 },
-        glm::vec3 { -1, -1, 1 },
-        glm::vec3 { -1, -1, -1 },
-    };
-
+    // Test the local AABB against frustum planes in clip space.
+    // Perspective-dividing the 8 corners first fails for large meshes
+    // (e.g. the Cornell ground plane): mixed/negative w flips NDC and
+    // the object can be culled while still covering the screen.
     glm::mat4 matrix = viewproj * obj.transform;
 
-    glm::vec3 min = { 1.5, 1.5, 1.5 };
-    glm::vec3 max = { -1.5, -1.5, -1.5 };
+    auto row = [&](int r) {
+        return glm::vec4(matrix[0][r], matrix[1][r], matrix[2][r], matrix[3][r]);
+    };
 
-    for (int c = 0; c < 8; c++) {
-        // project each corner into clip space
-        glm::vec4 v = matrix * glm::vec4(obj.bounds.origin + (corners[c] * obj.bounds.extents), 1.f);
+    const glm::vec4 planes[6] = {
+        row(3) + row(0),
+        row(3) - row(0),
+        row(3) + row(1),
+        row(3) - row(1),
+        row(2),
+        row(3) - row(2),
+    };
 
-        // perspective correction
-        v.x = v.x / v.w;
-        v.y = v.y / v.w;
-        v.z = v.z / v.w;
+    const glm::vec3 center = obj.bounds.origin;
+    const glm::vec3 extent = obj.bounds.extents;
 
-        min = glm::min(glm::vec3{ v.x, v.y, v.z }, min);
-        max = glm::max(glm::vec3{ v.x, v.y, v.z }, max);
+    for (const glm::vec4& plane : planes) {
+        float dist = glm::dot(glm::vec3(plane), center) + plane.w;
+        float radius = glm::dot(extent, glm::abs(glm::vec3(plane)));
+        if (dist + radius < 0.f) {
+            return false;
+        }
     }
-
-    // check the clip space box is within the view
-    if (min.z > 1.f || max.z < 0.f || min.x > 1.f || max.x < -1.f || min.y > 1.f || max.y < -1.f) {
-        return false;
-    }
-    else {
-        return true;
-    }
+    return true;
 }
 void VulkanEngine::init()
 {
@@ -93,33 +88,19 @@ void VulkanEngine::init()
 	init_sync_structures();
     init_descriptors();
     init_pipelines();
-	init_imgui();
-
-    // initialize the memory allocator
-    VmaAllocatorCreateInfo allocatorInfo = {};
-    allocatorInfo.physicalDevice = _chosenGPU;
-    allocatorInfo.device = _device;
-    allocatorInfo.instance = _instance;
-    allocatorInfo.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
-    vmaCreateAllocator(&allocatorInfo, &_allocator);
-
-    _mainDeletionQueue.push_function([&]() {
-        vmaDestroyAllocator(_allocator);
-        });
+    init_imgui();
 
     init_default_data();
     mainCamera.velocity = glm::vec3(0.f);
-    mainCamera.position = glm::vec3(30.f, -00.f, -085.f);
-
+    // looking into the open +Z face of the Cornell box
+    mainCamera.position = glm::vec3(0.f, 1.0f, 3.5f);
     mainCamera.pitch = 0;
     mainCamera.yaw = 0;
 
-    std::string structurePath = { "..\\assets\\structure.glb" };
-    auto structureFile = loadGltf(this, structurePath);
-
-    assert(structureFile.has_value());
-
-    loadedScenes["structure"] = *structureFile;
+    std::string cornellPath = { "..\\assets\\cornell.gltf" };
+    auto cornellFile = loadGltf(this, cornellPath);
+    assert(cornellFile.has_value());
+    loadedScenes["cornell"] = *cornellFile;
 
     // hide cursor and report unbounded relative motion for FPS look
     SDL_SetRelativeMouseMode(SDL_TRUE);
@@ -132,7 +113,11 @@ void VulkanEngine::init_pipelines()
 {
     init_background_pipelines();
     init_mesh_pipeline();
+    init_shadow_pipeline();
     metalRoughMaterial.build_pipelines(this);
+    _mainDeletionQueue.push_function([&]() {
+        metalRoughMaterial.clear_resources(_device);
+        });
 }
 
 void VulkanEngine::init_background_pipelines()
@@ -512,6 +497,10 @@ void VulkanEngine::draw()
     vkutil::transition_image(cmd, _drawImage.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     vkutil::transition_image(cmd, _depthImage.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
 
+    vkutil::transition_image(cmd, _shadowCubemap.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+    draw_shadows(cmd);
+    vkutil::transition_image(cmd, _shadowCubemap.image, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL);
+
     draw_geometry(cmd);
 
     //transition the draw image and the swapchain image into their correct transfer layouts
@@ -678,6 +667,7 @@ void VulkanEngine::init_descriptors()
     {
         DescriptorLayoutBuilder builder;
         builder.add_binding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        builder.add_binding(1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
         _gpuSceneDataDescriptorLayout = builder.build(_device, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
     }
 
@@ -700,6 +690,8 @@ void VulkanEngine::init_descriptors()
         globalDescriptorAllocator.destroy_pools(_device);
 
         vkDestroyDescriptorSetLayout(_device, _drawImageDescriptorLayout, nullptr);
+        vkDestroyDescriptorSetLayout(_device, _gpuSceneDataDescriptorLayout, nullptr);
+        vkDestroyDescriptorSetLayout(_device, _singleImageDescriptorLayout, nullptr);
         });
 
     for (int i = 0; i < FRAME_OVERLAP; i++) {
@@ -920,15 +912,6 @@ void VulkanEngine::draw_geometry(VkCommandBuffer cmd)
         }
         });
 
-    sceneData.ambientColor =
-        glm::vec4{ 0.1f, 0.1f, 0.1f, 1.0f };
-
-    sceneData.sunlightDirection =
-        glm::vec4{ 0.0f, 1.0f, 0.0f, 1.0f };
-
-    sceneData.sunlightColor =
-        glm::vec4{ 1.0f, 1.0f, 1.0f, 1.0f };
-
     AllocatedBuffer gpuSceneDataBuffer = create_buffer(sizeof(GPUSceneData), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
 
     get_current_frame()._deletionQueue.push_function([=, this](){
@@ -941,6 +924,7 @@ void VulkanEngine::draw_geometry(VkCommandBuffer cmd)
     DescriptorWriter writer;
 
     writer.write_buffer(0, gpuSceneDataBuffer.buffer, sizeof(GPUSceneData), 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+    writer.write_image(1, _shadowCubemap.imageView, _shadowSampler, VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
 
     writer.update_set(_device, globalDescriptor);
 
@@ -1147,6 +1131,8 @@ void VulkanEngine::init_default_data() {
         destroy_image(_errorCheckerboardImage);
         });
 
+    init_shadow_map();
+
 
 
     GLTFMetallic_Roughness::MaterialResources materialResources;
@@ -1283,6 +1269,191 @@ void VulkanEngine::destroy_image(const AllocatedImage& img)
     vmaDestroyImage(_allocator, img.image, img.allocation);
 }
 
+AllocatedImage VulkanEngine::create_cubemap(uint32_t extent, VkFormat format, VkImageUsageFlags usage)
+{
+    AllocatedImage newImage;
+    newImage.imageFormat = format;
+    newImage.imageExtent = { extent, extent, 1 };
+
+    VkImageCreateInfo img_info = vkinit::image_create_info(format, usage, newImage.imageExtent);
+    img_info.arrayLayers = 6;
+    img_info.flags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+
+    VmaAllocationCreateInfo allocinfo = {};
+    allocinfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    allocinfo.requiredFlags = VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    VK_CHECK(vmaCreateImage(_allocator, &img_info, &allocinfo, &newImage.image, &newImage.allocation, nullptr));
+
+    VkImageAspectFlags aspectFlag = (format == VK_FORMAT_D32_SFLOAT) ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+
+    VkImageViewCreateInfo view_info = vkinit::imageview_create_info(format, newImage.image, aspectFlag);
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+    view_info.subresourceRange.layerCount = 6;
+
+    VK_CHECK(vkCreateImageView(_device, &view_info, nullptr, &newImage.imageView));
+    return newImage;
+}
+
+void VulkanEngine::init_shadow_map()
+{
+    _shadowCubemap = create_cubemap(_shadowMapExtent.width, VK_FORMAT_D32_SFLOAT,
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+    for (uint32_t i = 0; i < 6; i++) {
+        VkImageViewCreateInfo viewInfo = vkinit::imageview_create_info(VK_FORMAT_D32_SFLOAT, _shadowCubemap.image, VK_IMAGE_ASPECT_DEPTH_BIT);
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.subresourceRange.baseArrayLayer = i;
+        viewInfo.subresourceRange.layerCount = 1;
+        VK_CHECK(vkCreateImageView(_device, &viewInfo, nullptr, &_shadowCubeFaceViews[i]));
+    }
+
+    VkSamplerCreateInfo sampl{ .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    sampl.magFilter = VK_FILTER_NEAREST;
+    sampl.minFilter = VK_FILTER_NEAREST;
+    sampl.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampl.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampl.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampl.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VK_CHECK(vkCreateSampler(_device, &sampl, nullptr, &_shadowSampler));
+
+    _mainDeletionQueue.push_function([&]() {
+        vkDestroySampler(_device, _shadowSampler, nullptr);
+        for (VkImageView view : _shadowCubeFaceViews) {
+            vkDestroyImageView(_device, view, nullptr);
+        }
+        destroy_image(_shadowCubemap);
+        });
+}
+
+void VulkanEngine::init_shadow_pipeline()
+{
+    VkShaderModule shadowFragShader;
+    if (!vkutil::load_shader_module("../shaders/shadow.frag.spv", _device, &shadowFragShader)) {
+        fmt::println("Error when building the shadow fragment shader module");
+    }
+
+    VkShaderModule shadowVertexShader;
+    if (!vkutil::load_shader_module("../shaders/shadow.vert.spv", _device, &shadowVertexShader)) {
+        fmt::println("Error when building the shadow vertex shader module");
+    }
+
+    VkPushConstantRange matrixRange{};
+    matrixRange.offset = 0;
+    matrixRange.size = sizeof(GPUDrawPushConstants);
+    matrixRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+    DescriptorLayoutBuilder layoutBuilder;
+    layoutBuilder.add_binding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+    _shadowDescriptorLayout = layoutBuilder.build(_device, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT);
+
+    VkPipelineLayoutCreateInfo layoutInfo = vkinit::pipeline_layout_create_info();
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &_shadowDescriptorLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &matrixRange;
+    VK_CHECK(vkCreatePipelineLayout(_device, &layoutInfo, nullptr, &_shadowPipelineLayout));
+
+    PipelineBuilder pipelineBuilder;
+    pipelineBuilder.set_shaders(shadowVertexShader, shadowFragShader);
+    pipelineBuilder.set_input_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+    pipelineBuilder.set_polygon_mode(VK_POLYGON_MODE_FILL);
+    pipelineBuilder.set_cull_mode(VK_CULL_MODE_NONE, VK_FRONT_FACE_CLOCKWISE);
+    pipelineBuilder.set_multisampling_none();
+    pipelineBuilder.disable_blending();
+    pipelineBuilder.disable_color_attachment();
+    pipelineBuilder.set_depth_format(VK_FORMAT_D32_SFLOAT);
+    pipelineBuilder.enable_depthtest(true, VK_COMPARE_OP_LESS);
+    pipelineBuilder._pipelineLayout = _shadowPipelineLayout;
+
+    _shadowPipeline = pipelineBuilder.build_pipeline(_device);
+
+    vkDestroyShaderModule(_device, shadowFragShader, nullptr);
+    vkDestroyShaderModule(_device, shadowVertexShader, nullptr);
+
+    _mainDeletionQueue.push_function([&]() {
+        vkDestroyPipeline(_device, _shadowPipeline, nullptr);
+        vkDestroyPipelineLayout(_device, _shadowPipelineLayout, nullptr);
+        vkDestroyDescriptorSetLayout(_device, _shadowDescriptorLayout, nullptr);
+        });
+}
+
+void VulkanEngine::draw_shadows(VkCommandBuffer cmd)
+{
+    const glm::vec3 lightPos = glm::vec3(sceneData.pointLightPosition);
+    const float farPlane = sceneData.shadowParams.x;
+    const float nearPlane = 0.05f;
+
+    glm::mat4 shadowProj = glm::perspective(glm::radians(90.0f), 1.0f, nearPlane, farPlane);
+
+    const glm::vec3 targets[6] = {
+        glm::vec3(1.f, 0.f, 0.f),
+        glm::vec3(-1.f, 0.f, 0.f),
+        glm::vec3(0.f, 1.f, 0.f),
+        glm::vec3(0.f, -1.f, 0.f),
+        glm::vec3(0.f, 0.f, 1.f),
+        glm::vec3(0.f, 0.f, -1.f),
+    };
+    const glm::vec3 ups[6] = {
+        glm::vec3(0.f, -1.f, 0.f),
+        glm::vec3(0.f, -1.f, 0.f),
+        glm::vec3(0.f, 0.f, 1.f),
+        glm::vec3(0.f, 0.f, -1.f),
+        glm::vec3(0.f, -1.f, 0.f),
+        glm::vec3(0.f, -1.f, 0.f),
+    };
+
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(_shadowMapExtent.width);
+    viewport.height = static_cast<float>(_shadowMapExtent.height);
+    viewport.minDepth = 0.f;
+    viewport.maxDepth = 1.f;
+
+    VkRect2D scissor{};
+    scissor.extent = _shadowMapExtent;
+
+    for (int face = 0; face < 6; face++) {
+        AllocatedBuffer ubo = create_buffer(sizeof(ShadowUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VMA_MEMORY_USAGE_CPU_TO_GPU);
+        get_current_frame()._deletionQueue.push_function([=, this]() {
+            destroy_buffer(ubo);
+            });
+
+        ShadowUBO* data = static_cast<ShadowUBO*>(ubo.allocation->GetMappedData());
+        data->lightViewProj = shadowProj * glm::lookAt(lightPos, lightPos + targets[face], ups[face]);
+        data->lightPosFar = glm::vec4(lightPos, farPlane);
+
+        VkDescriptorSet shadowSet = get_current_frame()._frameDescriptors.allocate(_device, _shadowDescriptorLayout);
+        DescriptorWriter writer;
+        writer.write_buffer(0, ubo.buffer, sizeof(ShadowUBO), 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+        writer.update_set(_device, shadowSet);
+
+        VkRenderingAttachmentInfo depthAttachment = vkinit::depth_attachment_info(
+            _shadowCubeFaceViews[face], VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, 1.f);
+        VkRenderingInfo renderInfo = vkinit::rendering_info(_shadowMapExtent, nullptr, &depthAttachment);
+        vkCmdBeginRendering(cmd, &renderInfo);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _shadowPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _shadowPipelineLayout, 0, 1, &shadowSet, 0, nullptr);
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        VkBuffer lastIndexBuffer = VK_NULL_HANDLE;
+        for (const RenderObject& r : mainDrawContext.OpaqueSurfaces) {
+            if (r.indexBuffer != lastIndexBuffer) {
+                lastIndexBuffer = r.indexBuffer;
+                vkCmdBindIndexBuffer(cmd, r.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+            }
+
+            GPUDrawPushConstants push_constants;
+            push_constants.worldMatrix = r.transform;
+            push_constants.vertexBuffer = r.vertexBufferAddress;
+            vkCmdPushConstants(cmd, _shadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(GPUDrawPushConstants), &push_constants);
+            vkCmdDrawIndexed(cmd, r.indexCount, 1, r.firstIndex, 0, 0);
+        }
+
+        vkCmdEndRendering(cmd);
+    }
+}
 
 void GLTFMetallic_Roughness::build_pipelines(VulkanEngine* engine)
 {
@@ -1421,13 +1592,8 @@ void VulkanEngine::update_scene()
     mainDrawContext.OpaqueSurfaces.clear();
     mainDrawContext.TransparentSurfaces.clear();
 
-    loadedNodes["Suzanne"]->Draw(glm::mat4{ 1.f }, mainDrawContext);
-    for (int x = -3; x < 3; x++) {
-        glm::mat4 scale = glm::scale(glm::vec3{ 0.2 });
-        glm::mat4 translation = glm::translate(glm::vec3{ x, 1, 0 });
-        loadedNodes["Cube"]->Draw(translation * scale, mainDrawContext);
-    }
-    loadedScenes["structure"]->Draw(glm::mat4{ 1.f }, mainDrawContext);
+    // loadedNodes["Suzanne"]->Draw(glm::mat4{ 1.f }, mainDrawContext);
+    loadedScenes["cornell"]->Draw(glm::mat4{ 1.f }, mainDrawContext);
 
     mainCamera.update();
 
@@ -1444,10 +1610,11 @@ void VulkanEngine::update_scene()
     sceneData.proj = projection;
     sceneData.viewproj = projection * view;
 
-    //some default lighting parameters
-    sceneData.ambientColor = glm::vec4(.1f);
-    sceneData.sunlightColor = glm::vec4(1.f);
-    sceneData.sunlightDirection = glm::vec4(0, 1, 0.5, 1.f);
+    // Blender (0, 0, 2) exported with Khronos glTF (+Y up) becomes engine (0, 2, 0)
+    sceneData.ambientColor = glm::vec4(0.04f, 0.04f, 0.04f, 1.f);
+    sceneData.pointLightPosition = glm::vec4(0.f, 2.f, 0.f, 20.f);
+    sceneData.pointLightColor = glm::vec4(1.f, 1.f, 1.f, 1.f);
+    sceneData.shadowParams = glm::vec4(20.f, 0.05f, 0.f, 0.f);
 
     auto end = std::chrono::system_clock::now();
 

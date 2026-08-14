@@ -88,8 +88,14 @@ VkPipeline PipelineBuilder::build_pipeline(VkDevice device)
 
     colorBlending.logicOpEnable = VK_FALSE;
     colorBlending.logicOp = VK_LOGIC_OP_COPY;
-    colorBlending.attachmentCount = 1;
-    colorBlending.pAttachments = &_colorBlendAttachment;
+    if (_renderInfo.colorAttachmentCount == 0) {
+        colorBlending.attachmentCount = 0;
+        colorBlending.pAttachments = nullptr;
+    }
+    else {
+        colorBlending.attachmentCount = 1;
+        colorBlending.pAttachments = &_colorBlendAttachment;
+    }
 
     // completely clear VertexInputStateCreateInfo, as we have no need for it
     VkPipelineVertexInputStateCreateInfo _vertexInputInfo = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
@@ -189,6 +195,13 @@ void PipelineBuilder::set_color_attachment_format(VkFormat format)
     // connect the format to the renderInfo  structure
     _renderInfo.colorAttachmentCount = 1;
     _renderInfo.pColorAttachmentFormats = &_colorAttachmentformat;
+}
+
+void PipelineBuilder::disable_color_attachment()
+{
+    _colorAttachmentformat = VK_FORMAT_UNDEFINED;
+    _renderInfo.colorAttachmentCount = 0;
+    _renderInfo.pColorAttachmentFormats = nullptr;
 }
 
 void PipelineBuilder::set_depth_format(VkFormat format)

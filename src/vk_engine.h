@@ -17,8 +17,14 @@ struct GPUSceneData {
 	glm::mat4 proj;
 	glm::mat4 viewproj;
 	glm::vec4 ambientColor;
-	glm::vec4 sunlightDirection; // w for sun power
-	glm::vec4 sunlightColor;
+	glm::vec4 pointLightPosition; // xyz = world position, w = intensity
+	glm::vec4 pointLightColor;
+	glm::vec4 shadowParams; // x = far plane, y = bias
+};
+
+struct ShadowUBO {
+	glm::mat4 lightViewProj;
+	glm::vec4 lightPosFar; // xyz = world position, w = far plane
 };
 struct EngineStats {
 	float frametime;
@@ -196,6 +202,14 @@ public:
 
 	VkDescriptorSetLayout _gpuSceneDataDescriptorLayout;
 
+	AllocatedImage _shadowCubemap;
+	std::array<VkImageView, 6> _shadowCubeFaceViews{};
+	VkSampler _shadowSampler;
+	VkExtent2D _shadowMapExtent{ 1024, 1024 };
+	VkPipeline _shadowPipeline;
+	VkPipelineLayout _shadowPipelineLayout;
+	VkDescriptorSetLayout _shadowDescriptorLayout;
+
 
 	AllocatedImage _whiteImage;
 	AllocatedImage _blackImage;
@@ -252,6 +266,7 @@ public:
 
 	AllocatedImage create_image(VkExtent3D size, VkFormat format, VkImageUsageFlags usage, bool mipmapped = false);
 	AllocatedImage create_image(void* data, VkExtent3D size, VkFormat format, VkImageUsageFlags usage, bool mipmapped = false);
+	AllocatedImage create_cubemap(uint32_t extent, VkFormat format, VkImageUsageFlags usage);
 	void destroy_image(const AllocatedImage& img);
 	AllocatedBuffer create_buffer(size_t allocSize, VkBufferUsageFlags usage, VmaMemoryUsage memoryUsage);
 	void destroy_buffer(const AllocatedBuffer& buffer);
@@ -271,6 +286,9 @@ private:
 	void init_imgui();
 	void draw_imgui(VkCommandBuffer cmd, VkImageView targetImageView);
 	void draw_geometry(VkCommandBuffer cmd);
+	void draw_shadows(VkCommandBuffer cmd);
+	void init_shadow_pipeline();
+	void init_shadow_map();
 	void init_default_data();
 	void resize_swapchain();
 };
