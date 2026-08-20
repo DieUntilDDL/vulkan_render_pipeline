@@ -26,6 +26,7 @@ struct AllocatedImage {
     VmaAllocation allocation;
     VkExtent3D imageExtent;
     VkFormat imageFormat;
+    uint32_t mipLevels{ 1 };
 };
 
 struct AllocatedBuffer {
@@ -41,6 +42,7 @@ struct Vertex {
     glm::vec3 normal;
     float uv_y;
     glm::vec4 color;
+    glm::vec4 tangent;
 };
 
 // holds the resources needed for a mesh

@@ -1,4 +1,4 @@
-﻿// vulkan_guide.h : Include file for standard system include files,
+// vulkan_guide.h : Include file for standard system include files,
 // or project specific include files.
 
 #pragma once
@@ -16,10 +16,16 @@ struct GPUSceneData {
 	glm::mat4 view;
 	glm::mat4 proj;
 	glm::mat4 viewproj;
-	glm::vec4 ambientColor;
-	glm::vec4 pointLightPosition; // xyz = world position, w = intensity
+	glm::mat4 lightViewProj; // area-light 2D shadow projection
+	glm::vec4 ambientColor; // rgb = color, a = intensity
+	glm::vec4 pointLightPosition; // xyz = point light, w = intensity
 	glm::vec4 pointLightColor;
-	glm::vec4 shadowParams; // x = far plane, y = bias
+	glm::vec4 areaLightPosition; // xyz = area-light center, w = intensity
+	glm::vec4 areaLightColor;
+	glm::vec4 shadowParams; // x = far, y = point bias, z = area projective bias
+	glm::vec4 cameraPosition; // xyz = world position
+	glm::vec4 specularParams; // x = ks, y = shininess, z = roughness influence, w = IBL intensity
+	glm::vec4 pcssParams; // x = light width, y = light height, z = max penumbra UV, w = near
 };
 
 struct ShadowUBO {
@@ -86,8 +92,8 @@ struct GLTFMetallic_Roughness {
 	struct MaterialConstants {
 		glm::vec4 colorFactors;
 		glm::vec4 metal_rough_factors;
-		//padding, we need it anyway for uniform buffers
-		glm::vec4 extra[14];
+		glm::vec4 emissiveFactor;
+		glm::vec4 extra[13];
 	};
 
 	struct MaterialResources {
@@ -95,6 +101,10 @@ struct GLTFMetallic_Roughness {
 		VkSampler colorSampler;
 		AllocatedImage metalRoughImage;
 		VkSampler metalRoughSampler;
+		AllocatedImage emissiveImage;
+		VkSampler emissiveSampler;
+		AllocatedImage normalImage;
+		VkSampler normalSampler;
 		VkBuffer dataBuffer;
 		uint32_t dataBufferOffset;
 	};
@@ -152,6 +162,7 @@ public:
 	VkSurfaceKHR _surface;
 
 	AllocatedImage _drawImage;
+	AllocatedImage _tonemapImage;
 	AllocatedImage _depthImage;
 
 	VkSwapchainKHR _swapchain;
@@ -199,14 +210,32 @@ public:
 	float renderScale = 1.f;
 
 	GPUSceneData sceneData;
+	glm::vec3 ambientLightColor{ 1.f, 1.f, 1.f };
+	float ambientIntensity = 0.04f;
+	glm::vec3 pointLightPos{ 2.f, 1.5f, 2.f };
+	glm::vec3 pointLightCol{ 1.f, 1.f, 1.f };
+	float pointLightIntensity = 8.f;
+	float specularStrength = 0.45f;
+	float specularShininess = 64.f;
+	float specularRoughnessInfluence = 1.f;
+	float areaLightWidth = 0.47f;
+	float areaLightHeight = 0.39f;
+	float areaLightIntensity = 0.f;
+	float pcssMaxPenumbra = 0.06f;
+	float iblIntensity = 1.f;
+	float exposure = 1.f;
 
 	VkDescriptorSetLayout _gpuSceneDataDescriptorLayout;
 
-	AllocatedImage _shadowCubemap;
-	std::array<VkImageView, 6> _shadowCubeFaceViews{};
+	AllocatedImage _shadowMap;
 	VkSampler _shadowSampler;
 	VkExtent2D _shadowMapExtent{ 1024, 1024 };
+	AllocatedImage _shadowCubemap;
+	std::array<VkImageView, 6> _shadowCubeFaceViews{};
+	VkSampler _shadowCubeSampler;
+	VkExtent2D _shadowCubeExtent{ 512, 512 };
 	VkPipeline _shadowPipeline;
+	VkPipeline _shadowCubePipeline;
 	VkPipelineLayout _shadowPipelineLayout;
 	VkDescriptorSetLayout _shadowDescriptorLayout;
 
@@ -215,6 +244,7 @@ public:
 	AllocatedImage _blackImage;
 	AllocatedImage _greyImage;
 	AllocatedImage _errorCheckerboardImage;
+	AllocatedImage _flatNormalImage;
 
 	VkSampler _defaultSamplerLinear;
 	VkSampler _defaultSamplerNearest;
@@ -265,8 +295,8 @@ public:
 	GPUMeshBuffers uploadMesh(std::span<uint32_t> indices, std::span<Vertex> vertices);
 
 	AllocatedImage create_image(VkExtent3D size, VkFormat format, VkImageUsageFlags usage, bool mipmapped = false);
-	AllocatedImage create_image(void* data, VkExtent3D size, VkFormat format, VkImageUsageFlags usage, bool mipmapped = false);
-	AllocatedImage create_cubemap(uint32_t extent, VkFormat format, VkImageUsageFlags usage);
+	AllocatedImage create_image(void* data, VkExtent3D size, VkFormat format, VkImageUsageFlags usage, bool mipmapped = false, size_t bytesPerPixel = 4);
+	AllocatedImage create_cubemap(uint32_t extent, VkFormat format, VkImageUsageFlags usage, uint32_t mipLevels = 1);
 	void destroy_image(const AllocatedImage& img);
 	AllocatedBuffer create_buffer(size_t allocSize, VkBufferUsageFlags usage, VmaMemoryUsage memoryUsage);
 	void destroy_buffer(const AllocatedBuffer& buffer);
@@ -283,13 +313,39 @@ private:
 	void init_descriptors();
 	void init_pipelines();
 	void init_background_pipelines();
+	void init_tonemap_pipeline();
+	void draw_tonemap(VkCommandBuffer cmd);
 	void init_imgui();
 	void draw_imgui(VkCommandBuffer cmd, VkImageView targetImageView);
 	void draw_geometry(VkCommandBuffer cmd);
 	void draw_shadows(VkCommandBuffer cmd);
+	void draw_point_light_shadows(VkCommandBuffer cmd);
+	void draw_area_light_shadows(VkCommandBuffer cmd);
 	void init_shadow_pipeline();
 	void init_shadow_map();
+	void init_ibl();
+	bool bake_irradiance();
+	bool bake_prefiltered();
+	bool bake_brdf_lut();
+	void draw_skybox(VkCommandBuffer cmd);
 	void init_default_data();
 	void resize_swapchain();
-};
 
+	AllocatedImage _envCubemap{};
+	AllocatedImage _irradianceCubemap{};
+	AllocatedImage _prefilteredCubemap{};
+	AllocatedImage _brdfLut{};
+	VkSampler _iblCubeSampler{ VK_NULL_HANDLE };
+	VkSampler _iblLutSampler{ VK_NULL_HANDLE };
+	VkDescriptorSetLayout _skyboxDescriptorLayout{ VK_NULL_HANDLE };
+	VkPipelineLayout _skyboxPipelineLayout{ VK_NULL_HANDLE };
+	VkPipeline _skyboxPipeline{ VK_NULL_HANDLE };
+	VkDescriptorSet _skyboxDescriptorSet{ VK_NULL_HANDLE };
+	bool _iblReady{ false };
+
+	VkDescriptorSetLayout _tonemapDescriptorLayout{ VK_NULL_HANDLE };
+	VkPipelineLayout _tonemapPipelineLayout{ VK_NULL_HANDLE };
+	VkPipeline _tonemapPipeline{ VK_NULL_HANDLE };
+	VkDescriptorSet _tonemapDescriptorSet{ VK_NULL_HANDLE };
+	VkSampler _tonemapSampler{ VK_NULL_HANDLE };
+};

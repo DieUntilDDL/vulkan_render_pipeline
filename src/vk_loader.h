@@ -44,6 +44,17 @@ class VulkanEngine;
 
 std::optional<std::vector<std::shared_ptr<MeshAsset>>> loadGltfMeshes(VulkanEngine* engine, std::filesystem::path filePath);
 
+struct AreaLight {
+    glm::vec3 position{ 0.f };
+    glm::vec3 normal{ 0.f, -1.f, 0.f };
+    glm::vec3 tangent{ 1.f, 0.f, 0.f };
+    glm::vec3 bitangent{ 0.f, 0.f, 1.f };
+    glm::vec2 size{ 0.f, 0.f };
+    glm::vec3 color{ 1.f };
+    float intensity{ 20.f };
+    bool valid{ false };
+};
+
 struct LoadedGLTF : public IRenderable {
 
     // storage for all the data on a given glTF file
@@ -60,6 +71,8 @@ struct LoadedGLTF : public IRenderable {
     DescriptorAllocatorGrowable descriptorPool;
 
     AllocatedBuffer materialDataBuffer;
+
+    AreaLight areaLight;
 
     VulkanEngine* creator;
 

@@ -36,7 +36,7 @@ VkSamplerMipmapMode extract_mipmap_mode(fastgltf::Filter filter)
     }
 }
 
-std::optional<AllocatedImage> load_image(VulkanEngine* engine, fastgltf::Asset& asset, fastgltf::Image& image)
+std::optional<AllocatedImage> load_image(VulkanEngine* engine, fastgltf::Asset& asset, fastgltf::Image& image, const std::filesystem::path& baseDir)
 {
     AllocatedImage newImage{};
 
@@ -52,7 +52,11 @@ std::optional<AllocatedImage> load_image(VulkanEngine* engine, fastgltf::Asset& 
 
 const std::string path(filePath.uri.path().begin(),
     filePath.uri.path().end()); // Thanks C++.
-unsigned char* data = stbi_load(path.c_str(), &width, &height, &nrChannels, 4);
+std::filesystem::path fullPath = path;
+if (fullPath.is_relative()) {
+    fullPath = baseDir / fullPath;
+}
+unsigned char* data = stbi_load(fullPath.string().c_str(), &width, &height, &nrChannels, 4);
 if (data) {
     VkExtent3D imagesize;
     imagesize.width = width;
@@ -114,6 +118,51 @@ buffer.data);
     }
     else {
         return newImage;
+    }
+}
+
+static void generate_tangents(std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices,
+    uint32_t firstVertex, uint32_t vertexCount, uint32_t firstIndex, uint32_t indexCount)
+{
+    std::vector<glm::vec3> tanAcc(vertices.size(), glm::vec3(0.f));
+    std::vector<glm::vec3> bitAcc(vertices.size(), glm::vec3(0.f));
+
+    for (uint32_t i = 0; i + 2 < indexCount; i += 3) {
+        uint32_t i0 = indices[firstIndex + i];
+        uint32_t i1 = indices[firstIndex + i + 1];
+        uint32_t i2 = indices[firstIndex + i + 2];
+        const Vertex& v0 = vertices[i0];
+        const Vertex& v1 = vertices[i1];
+        const Vertex& v2 = vertices[i2];
+
+        glm::vec3 e1 = v1.position - v0.position;
+        glm::vec3 e2 = v2.position - v0.position;
+        glm::vec2 d1 = glm::vec2(v1.uv_x - v0.uv_x, v1.uv_y - v0.uv_y);
+        glm::vec2 d2 = glm::vec2(v2.uv_x - v0.uv_x, v2.uv_y - v0.uv_y);
+        float det = d1.x * d2.y - d2.x * d1.y;
+        float f = (glm::abs(det) < 1e-8f) ? 1.f : 1.f / det;
+        glm::vec3 t = f * (d2.y * e1 - d1.y * e2);
+        glm::vec3 b = f * (-d2.x * e1 + d1.x * e2);
+        tanAcc[i0] += t;
+        tanAcc[i1] += t;
+        tanAcc[i2] += t;
+        bitAcc[i0] += b;
+        bitAcc[i1] += b;
+        bitAcc[i2] += b;
+    }
+
+    for (uint32_t i = 0; i < vertexCount; ++i) {
+        Vertex& vtx = vertices[firstVertex + i];
+        glm::vec3 n = glm::normalize(vtx.normal);
+        glm::vec3 t = tanAcc[firstVertex + i];
+        t = t - n * glm::dot(n, t);
+        if (glm::dot(t, t) < 1e-12f) {
+            t = (glm::abs(n.y) < 0.999f) ? glm::cross(glm::vec3(0.f, 1.f, 0.f), n)
+                                         : glm::cross(glm::vec3(1.f, 0.f, 0.f), n);
+        }
+        t = glm::normalize(t);
+        float w = (glm::dot(glm::cross(n, t), bitAcc[firstVertex + i]) < 0.f) ? -1.f : 1.f;
+        vtx.tangent = glm::vec4(t, w);
     }
 }
 
@@ -185,6 +234,7 @@ std::optional<std::vector<std::shared_ptr<MeshAsset>>> loadGltfMeshes(VulkanEngi
                         newvtx.color = glm::vec4{ 1.f };
                         newvtx.uv_x = 0;
                         newvtx.uv_y = 0;
+                        newvtx.tangent = { 1.f, 0.f, 0.f, 1.f };
                         vertices[initial_vtx + index] = newvtx;
                     });
             }
@@ -218,6 +268,18 @@ std::optional<std::vector<std::shared_ptr<MeshAsset>>> loadGltfMeshes(VulkanEngi
                     [&](glm::vec4 v, size_t index) {
                         vertices[initial_vtx + index].color = v;
                     });
+            }
+
+            auto tangents = p.findAttribute("TANGENT");
+            if (tangents != p.attributes.end()) {
+                fastgltf::iterateAccessorWithIndex<glm::vec4>(gltf, gltf.accessors[(*tangents).second],
+                    [&](glm::vec4 v, size_t index) {
+                        vertices[initial_vtx + index].tangent = v;
+                    });
+            }
+            else {
+                generate_tangents(vertices, indices, (uint32_t)initial_vtx, (uint32_t)(vertices.size() - initial_vtx),
+                    newSurface.startIndex, newSurface.count);
             }
 
             //loop the vertices of this surface, find min/max bounds
@@ -298,7 +360,7 @@ std::optional<std::shared_ptr<LoadedGLTF>> loadGltf(VulkanEngine* engine, std::s
     }
 
     std::vector<DescriptorAllocatorGrowable::PoolSizeRatio> sizes = {
-        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 5 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 }
     };
@@ -331,7 +393,7 @@ std::optional<std::shared_ptr<LoadedGLTF>> loadGltf(VulkanEngine* engine, std::s
 
     // load all textures
     for (fastgltf::Image& image : gltf.images) {
-        std::optional<AllocatedImage> img = load_image(engine, gltf, image);
+        std::optional<AllocatedImage> img = load_image(engine, gltf, image, path.parent_path());
 
         if (img.has_value()) {
             images.push_back(*img);
@@ -364,6 +426,11 @@ std::optional<std::shared_ptr<LoadedGLTF>> loadGltf(VulkanEngine* engine, std::s
 
         constants.metal_rough_factors.x = mat.pbrData.metallicFactor;
         constants.metal_rough_factors.y = mat.pbrData.roughnessFactor;
+        constants.emissiveFactor = glm::vec4(mat.emissiveFactor[0], mat.emissiveFactor[1], mat.emissiveFactor[2], 1.f);
+        constants.extra[0] = glm::vec4(1.f, 0.f, 0.f, 0.f);
+        if (mat.normalTexture.has_value()) {
+            constants.extra[0].x = mat.normalTexture->scale;
+        }
         // write material parameters to buffer
         sceneMaterialConstants[data_index] = constants;
 
@@ -378,17 +445,38 @@ std::optional<std::shared_ptr<LoadedGLTF>> loadGltf(VulkanEngine* engine, std::s
         materialResources.colorSampler = engine->_defaultSamplerLinear;
         materialResources.metalRoughImage = engine->_whiteImage;
         materialResources.metalRoughSampler = engine->_defaultSamplerLinear;
+        materialResources.emissiveImage = engine->_blackImage;
+        materialResources.emissiveSampler = engine->_defaultSamplerLinear;
+        materialResources.normalImage = engine->_flatNormalImage;
+        materialResources.normalSampler = engine->_defaultSamplerLinear;
 
         // set the uniform buffer for the material data
         materialResources.dataBuffer = file.materialDataBuffer.buffer;
         materialResources.dataBufferOffset = data_index * sizeof(GLTFMetallic_Roughness::MaterialConstants);
-        // grab textures from gltf file
-        if (mat.pbrData.baseColorTexture.has_value()) {
-            size_t img = gltf.textures[mat.pbrData.baseColorTexture.value().textureIndex].imageIndex.value();
-            size_t sampler = gltf.textures[mat.pbrData.baseColorTexture.value().textureIndex].samplerIndex.value();
 
-            materialResources.colorImage = images[img];
-            materialResources.colorSampler = file.samplers[sampler];
+        auto bind_texture = [&](const auto& info, AllocatedImage& image, VkSampler& sampler) {
+            if (!info.has_value()) {
+                return;
+            }
+            const fastgltf::Texture& tex = gltf.textures[info->textureIndex];
+            if (tex.imageIndex.has_value()) {
+                image = images[tex.imageIndex.value()];
+            }
+            if (tex.samplerIndex.has_value()) {
+                sampler = file.samplers[tex.samplerIndex.value()];
+            }
+        };
+        bind_texture(mat.pbrData.baseColorTexture, materialResources.colorImage, materialResources.colorSampler);
+        bind_texture(mat.pbrData.metallicRoughnessTexture, materialResources.metalRoughImage, materialResources.metalRoughSampler);
+        bind_texture(mat.emissiveTexture, materialResources.emissiveImage, materialResources.emissiveSampler);
+        if (mat.normalTexture.has_value()) {
+            const fastgltf::Texture& tex = gltf.textures[mat.normalTexture->textureIndex];
+            if (tex.imageIndex.has_value()) {
+                materialResources.normalImage = images[tex.imageIndex.value()];
+            }
+            if (tex.samplerIndex.has_value()) {
+                materialResources.normalSampler = file.samplers[tex.samplerIndex.value()];
+            }
         }
         // build material
         newMat->data = engine->metalRoughMaterial.write_material(engine->_device, passType, materialResources, file.descriptorPool);
@@ -442,6 +530,7 @@ std::optional<std::shared_ptr<LoadedGLTF>> loadGltf(VulkanEngine* engine, std::s
                         newvtx.color = glm::vec4{ 1.f };
                         newvtx.uv_x = 0;
                         newvtx.uv_y = 0;
+                        newvtx.tangent = { 1.f, 0.f, 0.f, 1.f };
                         vertices[initial_vtx + index] = newvtx;
                     });
             }
@@ -475,6 +564,18 @@ std::optional<std::shared_ptr<LoadedGLTF>> loadGltf(VulkanEngine* engine, std::s
                     [&](glm::vec4 v, size_t index) {
                         vertices[initial_vtx + index].color = v;
                     });
+            }
+
+            auto tangents = p.findAttribute("TANGENT");
+            if (tangents != p.attributes.end()) {
+                fastgltf::iterateAccessorWithIndex<glm::vec4>(gltf, gltf.accessors[(*tangents).second],
+                    [&](glm::vec4 v, size_t index) {
+                        vertices[initial_vtx + index].tangent = v;
+                    });
+            }
+            else {
+                generate_tangents(vertices, indices, (uint32_t)initial_vtx, (uint32_t)(vertices.size() - initial_vtx),
+                    newSurface.startIndex, newSurface.count);
             }
 
             if (p.materialIndex.has_value()) {
@@ -557,7 +658,32 @@ std::optional<std::shared_ptr<LoadedGLTF>> loadGltf(VulkanEngine* engine, std::s
         }
     }
 
-    
+    auto lightNodeIt = file.nodes.find("Plane");
+    if (lightNodeIt != file.nodes.end()) {
+        auto meshNode = std::dynamic_pointer_cast<MeshNode>(lightNodeIt->second);
+        if (meshNode && meshNode->mesh && !meshNode->mesh->surfaces.empty()) {
+            const Bounds& b = meshNode->mesh->surfaces[0].bounds;
+            const glm::mat4& w = meshNode->worldTransform;
+            file.areaLight.position = glm::vec3(w * glm::vec4(b.origin, 1.f));
+            glm::vec3 xAxis = glm::vec3(w[0]) * b.extents.x;
+            glm::vec3 zAxis = glm::vec3(w[2]) * b.extents.z;
+            file.areaLight.size = glm::vec2(2.f * glm::length(xAxis), 2.f * glm::length(zAxis));
+            glm::vec3 normal = glm::normalize(glm::vec3(w[1]));
+            if (normal.y > 0.f) {
+                normal = -normal;
+            }
+            file.areaLight.normal = normal;
+            file.areaLight.tangent = glm::normalize(xAxis);
+            file.areaLight.bitangent = glm::normalize(zAxis);
+            file.areaLight.color = glm::vec3(1.f);
+            file.areaLight.intensity = 20.f;
+            file.areaLight.valid = true;
+            fmt::println("Cornell area light: pos ({:.3f}, {:.3f}, {:.3f}) size {:.3f} x {:.3f}",
+                file.areaLight.position.x, file.areaLight.position.y, file.areaLight.position.z,
+                file.areaLight.size.x, file.areaLight.size.y);
+        }
+    }
+
     return scene;
 
 }
